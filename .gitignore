@@ -1,0 +1,6 @@
+.DS_Store
+.idea/
+.vscode/*
+*.test
+*.out
+coverage.html

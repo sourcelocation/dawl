@@ -1,0 +1,61 @@
+# Lint configuration for dawl. The depguard rule is the module's contract: apps import
+# subscription from their domain layer, so it may use the standard library only.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - depguard
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    depguard:
+      rules:
+        subscription:
+          list-mode: strict
+          files: ["**/subscription/**/*.go"]
+          allow:
+            - $gostd
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+        - name: receiver-naming
+        - name: error-strings
+        - name: context-as-argument
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close # deferred cleanup of response bodies
+    gosec:
+      excludes:
+        - G104 # unchecked errors are covered by errcheck
+        - G117 # secret fields are the point of the config types that hold them
+        - G704 # outbound URLs come from the app's configuration, not from requests
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003"]
+    gocritic:
+      enabled-tags: [diagnostic, performance]
+      disabled-checks: [hugeParam, rangeValCopy, commentedOutCode]
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose, unparam]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes: [github.com/sourcelocation/dawl]
