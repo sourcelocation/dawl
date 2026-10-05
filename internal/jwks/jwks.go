@@ -121,10 +121,15 @@ func (s *Set) refresh(ctx context.Context) error {
 			}
 			x, err1 := base64.RawURLEncoding.DecodeString(k.X)
 			y, err2 := base64.RawURLEncoding.DecodeString(k.Y)
-			if err1 != nil || err2 != nil {
+			if err1 != nil || err2 != nil || len(x) != 32 || len(y) != 32 { // RFC 7518: full-size coordinates
 				continue
 			}
-			keys[k.Kid] = &ecdsa.PublicKey{Curve: elliptic.P256(), X: new(big.Int).SetBytes(x), Y: new(big.Int).SetBytes(y)}
+			// The uncompressed point is 0x04 ‖ X ‖ Y; parsing it also rejects points off the curve.
+			key, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{4}, x...), y...))
+			if err != nil {
+				continue
+			}
+			keys[k.Kid] = key
 		}
 	}
 	s.keys, s.fetched = keys, time.Now()
