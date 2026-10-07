@@ -38,4 +38,4 @@ Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Co
 
 ## License
 
-dawl is free software under the [GNU Affero General Public License v3.0](LICENSE).
+dawl is released under the [MIT License](LICENSE).
