@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -258,4 +259,22 @@ func gatewayError(err error) error {
 		return fmt.Errorf("stripe: %w", err)
 	}
 	return fmt.Errorf("stripe: %w: %w", subscription.ErrUnavailable, err)
+}
+
+// Verify reads a subscription by id (subscription.Gateway).
+func (g *Gateway) Verify(ctx context.Context, proof string) (subscription.State, error) {
+	return g.Subscription(ctx, proof)
+}
+
+// Notification verifies a webhook request by its Stripe-Signature (subscription.Gateway).
+func (g *Gateway) Notification(_ context.Context, r *http.Request) (*subscription.State, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("stripe: %w: %w", subscription.ErrMalformed, err)
+	}
+	hook, err := g.ParseWebhook(body, r.Header.Get("Stripe-Signature"))
+	if err != nil {
+		return nil, err
+	}
+	return hook.Subscription, nil
 }

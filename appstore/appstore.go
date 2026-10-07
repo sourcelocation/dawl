@@ -275,3 +275,23 @@ func build(status int, tx transaction, r renewal) subscription.State {
 	}
 	return out
 }
+
+// Verify checks a StoreKit 2 signed transaction (subscription.Gateway).
+func (g *Gateway) Verify(ctx context.Context, proof string) (subscription.State, error) {
+	return g.VerifyTransaction(ctx, proof)
+}
+
+// Notification reads an App Store Server Notification V2 request (subscription.Gateway).
+func (g *Gateway) Notification(ctx context.Context, r *http.Request) (*subscription.State, error) {
+	var body struct {
+		SignedPayload string `json:"signedPayload"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || body.SignedPayload == "" {
+		return nil, fmt.Errorf("appstore: %w: notification body", subscription.ErrMalformed)
+	}
+	_, state, err := g.ParseNotification(ctx, body.SignedPayload)
+	if err != nil || state.ProviderRef == "" {
+		return nil, err
+	}
+	return &state, nil
+}

@@ -11,18 +11,17 @@ It is the store-facing half of billing, shared by [Rondo](https://github.com/sou
 | [`appstore`](appstore) | StoreKit 2 transactions and App Store Server Notifications V2, verified against Apple's root certificate; subscription status from the App Store Server API (production, then sandbox). |
 | [`googleplay`](googleplay) | Subscription state and acknowledgement from the Android Publisher API; Real-time Developer Notifications verified from their Pub/Sub push. |
 
-```go
-gw := stripe.New(stripe.Config{SecretKey: key, WebhookSecret: whsec, AccountMetadataKey: "app_account"})
+Every gateway is a `subscription.Gateway`: `Verify` checks proof from an app's purchase, and
+`Notification` reads a store's notification. `subscription.Webhook` serves notifications for any of them:
 
-hook, err := gw.ParseWebhook(body, r.Header.Get("Stripe-Signature"))
-switch {
-case errors.Is(err, subscription.ErrInvalidNotification):
-	// 401: not from Stripe
-case err != nil:
-	// 400 or 500
-case hook.Subscription != nil:
-	save(hook.Subscription.Account, *hook.Subscription) // then: hook.Subscription.Entitles(time.Now())
-}
+```go
+var gw subscription.Gateway = stripe.New(stripe.Config{SecretKey: key, WebhookSecret: whsec, AccountMetadataKey: "app_account"})
+
+http.Handle("POST /webhooks/stripe", subscription.Webhook(gw, func(ctx context.Context, s subscription.State) error {
+	return save(ctx, s.Account, s) // then: s.Entitles(time.Now())
+}))
+
+state, err := appStore.Verify(ctx, signedTransaction) // from StoreKit 2, in an app's request
 ```
 
 Every gateway wraps failures in one of the `subscription.Err*` values (`ErrUnverified`, `ErrNotSubscription`, `ErrInvalidNotification`, `ErrMalformed`, `ErrNotFound`, `ErrUnavailable`), so an app maps them onto its own errors with `errors.Is`. `State.Account` is the app's account id as the store carries it (Stripe metadata, `appAccountToken`, `obfuscatedExternalAccountId`); dawl never interprets it.

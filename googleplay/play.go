@@ -238,3 +238,35 @@ func toState(token string, s subscriptionV2) subscription.State {
 	}
 	return out
 }
+
+// Verify reads a subscription by purchase token and acknowledges it (subscription.Gateway).
+func (g *Gateway) Verify(ctx context.Context, proof string) (subscription.State, error) {
+	state, err := g.VerifySubscription(ctx, proof)
+	if err != nil {
+		return state, err
+	}
+	if state.Entitles(time.Now()) {
+		if err := g.Acknowledge(ctx, proof, state.ProductID); err != nil {
+			return state, err
+		}
+	}
+	return state, nil
+}
+
+// Notification reads a Real-time Developer Notification push and re-fetches the subscription it
+// names (subscription.Gateway).
+func (g *Gateway) Notification(ctx context.Context, r *http.Request) (*subscription.State, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("googleplay: %w: %w", subscription.ErrMalformed, err)
+	}
+	_, token, err := g.ParseNotification(ctx, r.Header.Get("Authorization"), body)
+	if err != nil || token == "" {
+		return nil, err
+	}
+	state, err := g.VerifySubscription(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
