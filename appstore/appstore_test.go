@@ -1,6 +1,7 @@
 package appstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -190,13 +191,13 @@ func newStore(t *testing.T, p pki) (*Gateway, *storeServer) {
 	return store, s
 }
 
-func TestVerifyTransactionUsesTheAuthoritativeStatus(t *testing.T) {
+func TestVerifyUsesTheAuthoritativeStatus(t *testing.T) {
 	p := newPKI(t, oidAppStoreLeaf, oidAppleWWDRIntermediate)
 	store, srv := newStore(t, p)
 	ctx := context.Background()
 	signed := p.sign(t, tx(time.Now().Add(time.Hour)))
 
-	sub, err := store.VerifyTransaction(ctx, signed)
+	sub, err := store.Verify(ctx, signed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,32 +209,32 @@ func TestVerifyTransactionUsesTheAuthoritativeStatus(t *testing.T) {
 	}
 
 	srv.renewal = map[string]any{"autoRenewStatus": 0}
-	if sub, _ := store.VerifyTransaction(ctx, signed); sub.Status != subscription.StatusCanceled || sub.AutoRenew {
+	if sub, _ := store.Verify(ctx, signed); sub.Status != subscription.StatusCanceled || sub.AutoRenew {
 		t.Fatalf("auto-renew off must read as canceled: %+v", sub)
 	}
 	grace := time.Now().Add(6 * 24 * time.Hour)
 	srv.status, srv.renewal = statusGracePeriod, map[string]any{"autoRenewStatus": 1, "gracePeriodExpiresDate": grace.UnixMilli()}
-	if sub, _ := store.VerifyTransaction(ctx, signed); sub.Status != subscription.StatusInGrace || sub.CurrentPeriodEnd.UnixMilli() != grace.UnixMilli() {
+	if sub, _ := store.Verify(ctx, signed); sub.Status != subscription.StatusInGrace || sub.CurrentPeriodEnd.UnixMilli() != grace.UnixMilli() {
 		t.Fatalf("grace: %+v", sub)
 	}
 	srv.status = statusRevoked
-	if sub, _ := store.VerifyTransaction(ctx, signed); sub.Status != subscription.StatusRevoked {
+	if sub, _ := store.Verify(ctx, signed); sub.Status != subscription.StatusRevoked {
 		t.Fatalf("revoked: %+v", sub)
 	}
 
 	srv.httpCode = http.StatusServiceUnavailable // Apple is down: the signed transaction decides
-	if sub, err := store.VerifyTransaction(ctx, signed); err != nil || sub.Status != subscription.StatusActive {
+	if sub, err := store.Verify(ctx, signed); err != nil || sub.Status != subscription.StatusActive {
 		t.Fatalf("outage fallback: %+v %v", sub, err)
 	}
 
 	other := tx(time.Now().Add(time.Hour))
 	other["bundleId"] = "com.example.other"
-	if _, err := store.VerifyTransaction(ctx, p.sign(t, other)); !errors.Is(err, subscription.ErrUnverified) {
+	if _, err := store.Verify(ctx, p.sign(t, other)); !errors.Is(err, subscription.ErrUnverified) {
 		t.Fatalf("foreign bundle accepted: %v", err)
 	}
 	consumable := tx(time.Now().Add(time.Hour))
 	consumable["type"] = "Consumable"
-	if _, err := store.VerifyTransaction(ctx, p.sign(t, consumable)); !errors.Is(err, subscription.ErrNotSubscription) {
+	if _, err := store.Verify(ctx, p.sign(t, consumable)); !errors.Is(err, subscription.ErrNotSubscription) {
 		t.Fatalf("consumable accepted: %v", err)
 	}
 }
@@ -242,19 +243,26 @@ func TestSubscriptionFallsBackToSandbox(t *testing.T) {
 	p := newPKI(t, oidAppStoreLeaf, oidAppleWWDRIntermediate)
 	store, srv := newStore(t, p)
 	srv.sandbox = true // e.g. an App Review purchase
-	sub, err := store.Subscription(context.Background(), "2000000001")
+	sub, err := store.current(context.Background(), "2000000001")
 	if err != nil || sub.Status != subscription.StatusActive {
 		t.Fatalf("sandbox fallback: %+v %v", sub, err)
 	}
-	if _, err := store.Subscription(context.Background(), "unknown"); !errors.Is(err, subscription.ErrNotFound) {
+	if _, err := store.current(context.Background(), "unknown"); !errors.Is(err, subscription.ErrNotFound) {
 		t.Fatalf("unknown subscription: %v", err)
 	}
 }
 
-func TestParseNotification(t *testing.T) {
+func push(t *testing.T, p pki, payload map[string]any) *http.Request {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"signedPayload": p.sign(t, payload)})
+	return httptest.NewRequest(http.MethodPost, "/webhooks/app-store", bytes.NewReader(body))
+}
+
+func TestNotificationsReadTheSubscriptionAgain(t *testing.T) {
 	p := newPKI(t, oidAppStoreLeaf, oidAppleWWDRIntermediate)
-	store, _ := newStore(t, p)
+	store, srv := newStore(t, p)
 	ctx := context.Background()
+	// An EXPIRED notification that arrives after the person renewed: the App Store's answer wins.
 	payload := map[string]any{
 		"notificationType": "EXPIRED", "notificationUUID": "uuid-1", "signedDate": time.Now().UnixMilli(),
 		"data": map[string]any{
@@ -262,21 +270,34 @@ func TestParseNotification(t *testing.T) {
 			"signedTransactionInfo": p.sign(t, tx(time.Now().Add(-time.Hour))), "signedRenewalInfo": p.sign(t, map[string]any{"autoRenewStatus": 0}),
 		},
 	}
-	id, sub, err := store.ParseNotification(ctx, p.sign(t, payload))
-	if err != nil || id != "uuid-1" || sub.Status != subscription.StatusExpired || sub.ProviderRef != "2000000001" {
-		t.Fatalf("id=%s sub=%+v err=%v", id, sub, err)
+	sub, err := store.Notification(ctx, push(t, p, payload))
+	if err != nil || sub == nil || sub.Status != subscription.StatusActive || sub.ProviderRef != "2000000001" {
+		t.Fatalf("sub=%+v err=%v", sub, err)
+	}
+
+	// One the App Store no longer knows: the notification, signed by Apple, stands.
+	gone := tx(time.Now().Add(-time.Hour))
+	gone["originalTransactionId"] = "2000000099"
+	data := payload["data"].(map[string]any)
+	data["signedTransactionInfo"] = p.sign(t, gone)
+	if sub, err := store.Notification(ctx, push(t, p, payload)); err != nil || sub == nil || sub.Status != subscription.StatusExpired || sub.ProviderRef != "2000000099" {
+		t.Fatalf("unknown to the App Store: %+v %v", sub, err)
+	}
+	srv.httpCode = http.StatusServiceUnavailable
+	if _, err := store.Notification(ctx, push(t, p, payload)); !errors.Is(err, subscription.ErrUnavailable) {
+		t.Fatalf("an outage is retried later: %v", err)
 	}
 
 	payload["data"].(map[string]any)["appAppleId"] = 7
-	if _, _, err := store.ParseNotification(ctx, p.sign(t, payload)); !errors.Is(err, subscription.ErrInvalidNotification) {
+	if _, err := store.Notification(ctx, push(t, p, payload)); !errors.Is(err, subscription.ErrInvalidNotification) {
 		t.Fatalf("notification for another app accepted: %v", err)
 	}
 	stranger := newPKI(t, oidAppStoreLeaf, oidAppleWWDRIntermediate)
-	if _, _, err := store.ParseNotification(ctx, stranger.sign(t, payload)); !errors.Is(err, subscription.ErrInvalidNotification) {
+	if _, err := store.Notification(ctx, push(t, stranger, payload)); !errors.Is(err, subscription.ErrInvalidNotification) {
 		t.Fatalf("notification signed by a stranger accepted: %v", err)
 	}
 	test := map[string]any{"notificationType": "TEST", "notificationUUID": "uuid-2", "data": map[string]any{"bundleId": bundle, "environment": "Sandbox"}}
-	if id, sub, err := store.ParseNotification(ctx, p.sign(t, test)); err != nil || id != "uuid-2" || sub.ProviderRef != "" {
-		t.Fatalf("test notification: %s %+v %v", id, sub, err)
+	if sub, err := store.Notification(ctx, push(t, p, test)); err != nil || sub != nil {
+		t.Fatalf("test notification: %+v %v", sub, err)
 	}
 }

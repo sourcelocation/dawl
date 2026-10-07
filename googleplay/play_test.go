@@ -75,7 +75,7 @@ func newPlay(t *testing.T) (*Gateway, *playServer) {
 	return play, s
 }
 
-func TestVerifySubscriptionMapsStates(t *testing.T) {
+func TestStatesAreNormalised(t *testing.T) {
 	play, srv := newPlay(t)
 	ctx := context.Background()
 	for state, want := range map[string]subscription.Status{
@@ -89,7 +89,7 @@ func TestVerifySubscriptionMapsStates(t *testing.T) {
 		"SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED": subscription.StatusExpired,
 	} {
 		srv.state = state
-		sub, err := play.VerifySubscription(ctx, "tok-1")
+		sub, err := play.current(ctx, "tok-1")
 		if err != nil || sub.Status != want {
 			t.Fatalf("%s → %+v %v", state, sub, err)
 		}
@@ -100,7 +100,7 @@ func TestVerifySubscriptionMapsStates(t *testing.T) {
 			t.Fatalf("expiry %v", sub.CurrentPeriodEnd)
 		}
 	}
-	if _, err := play.VerifySubscription(ctx, "forged"); !errors.Is(err, subscription.ErrUnverified) {
+	if _, err := play.current(ctx, "forged"); !errors.Is(err, subscription.ErrUnverified) {
 		t.Fatalf("unknown token: %v", err)
 	}
 }
@@ -108,15 +108,15 @@ func TestVerifySubscriptionMapsStates(t *testing.T) {
 func TestAcknowledgeIsIdempotent(t *testing.T) {
 	play, srv := newPlay(t)
 	ctx := context.Background()
-	if err := play.Acknowledge(ctx, "tok-1", "app_pro"); err != nil || !srv.acked {
+	if err := play.acknowledge(ctx, "tok-1", "app_pro"); err != nil || !srv.acked {
 		t.Fatalf("ack: %v", err)
 	}
 	srv.ackOK = false // Play rejects a second acknowledgement
-	if err := play.Acknowledge(ctx, "tok-1", "app_pro"); err != nil {
+	if err := play.acknowledge(ctx, "tok-1", "app_pro"); err != nil {
 		t.Fatalf("second ack must succeed: %v", err)
 	}
 	srv.acked = false
-	if err := play.Acknowledge(ctx, "tok-1", "app_pro"); err == nil {
+	if err := play.acknowledge(ctx, "tok-1", "app_pro"); err == nil {
 		t.Fatal("failed, unacknowledged purchase must report an error")
 	}
 }
@@ -134,24 +134,24 @@ func (s *playServer) push(t *testing.T, claims jwt.MapClaims, notification map[s
 	return "Bearer " + signed, body
 }
 
-func TestParseNotificationVerifiesThePush(t *testing.T) {
+func TestPushesAreVerified(t *testing.T) {
 	play, srv := newPlay(t)
 	ctx := context.Background()
 	valid := jwt.MapClaims{"iss": "https://accounts.google.com", "aud": pushAud, "email": pushSA, "email_verified": true, "exp": time.Now().Add(time.Hour).Unix()}
 	sub := map[string]any{"packageName": pkg, "subscriptionNotification": map[string]any{"notificationType": 4, "purchaseToken": "tok-1"}}
 
 	auth, body := srv.push(t, valid, sub)
-	if id, token, err := play.ParseNotification(ctx, auth, body); err != nil || id != "m-1" || token != "tok-1" {
-		t.Fatalf("%s %s %v", id, token, err)
+	if token, err := play.purchaseToken(ctx, auth, body); err != nil || token != "tok-1" {
+		t.Fatalf("%s %v", token, err)
 	}
 	voided := map[string]any{"packageName": pkg, "voidedPurchaseNotification": map[string]any{"purchaseToken": "tok-2", "productType": 1}}
 	auth, body = srv.push(t, valid, voided)
-	if _, token, err := play.ParseNotification(ctx, auth, body); err != nil || token != "tok-2" {
+	if token, err := play.purchaseToken(ctx, auth, body); err != nil || token != "tok-2" {
 		t.Fatalf("voided: %s %v", token, err)
 	}
 	test := map[string]any{"packageName": pkg, "testNotification": map[string]any{"version": "1.0"}}
 	auth, body = srv.push(t, valid, test)
-	if _, token, err := play.ParseNotification(ctx, auth, body); err != nil || token != "" {
+	if token, err := play.purchaseToken(ctx, auth, body); err != nil || token != "" {
 		t.Fatalf("test: %s %v", token, err)
 	}
 
@@ -161,20 +161,20 @@ func TestParseNotificationVerifiesThePush(t *testing.T) {
 		"expired":        {"iss": "https://accounts.google.com", "aud": pushAud, "email": pushSA, "email_verified": true, "exp": time.Now().Add(-time.Hour).Unix()},
 	} {
 		auth, body := srv.push(t, claims, sub)
-		if _, _, err := play.ParseNotification(ctx, auth, body); !errors.Is(err, subscription.ErrInvalidNotification) {
+		if _, err := play.purchaseToken(ctx, auth, body); !errors.Is(err, subscription.ErrInvalidNotification) {
 			t.Errorf("%s accepted: %v", name, err)
 		}
 	}
 	other := map[string]any{"packageName": "com.example.other", "subscriptionNotification": map[string]any{"purchaseToken": "tok-1"}}
 	auth, body = srv.push(t, valid, other)
-	if _, _, err := play.ParseNotification(ctx, auth, body); !errors.Is(err, subscription.ErrInvalidNotification) {
+	if _, err := play.purchaseToken(ctx, auth, body); !errors.Is(err, subscription.ErrInvalidNotification) {
 		t.Errorf("other package accepted: %v", err)
 	}
-	if _, _, err := play.ParseNotification(ctx, "", body); !errors.Is(err, subscription.ErrInvalidNotification) {
+	if _, err := play.purchaseToken(ctx, "", body); !errors.Is(err, subscription.ErrInvalidNotification) {
 		t.Errorf("missing token accepted: %v", err)
 	}
 	auth, _ = srv.push(t, valid, sub)
-	if _, _, err := play.ParseNotification(ctx, auth, []byte(`{"message":{}}`)); !errors.Is(err, subscription.ErrMalformed) {
+	if _, err := play.purchaseToken(ctx, auth, []byte(`{"message":{}}`)); !errors.Is(err, subscription.ErrMalformed) {
 		t.Errorf("malformed push accepted: %v", err)
 	}
 }

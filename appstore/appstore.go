@@ -123,10 +123,10 @@ const (
 	statusRevoked      = 5
 )
 
-// VerifyTransaction checks a StoreKit 2 transaction signed by Apple, then asks the App Store for
-// the subscription's current status. If Apple's API is down, the verified transaction alone
-// decides — a person who just paid is never turned away by an outage.
-func (g *Gateway) VerifyTransaction(ctx context.Context, signedTransaction string) (subscription.State, error) {
+// Verify checks a StoreKit 2 transaction signed by Apple, then asks the App Store for the
+// subscription's current status. If Apple's API is down, the verified transaction alone decides —
+// a person who just paid is never turned away by an outage (subscription.Gateway).
+func (g *Gateway) Verify(ctx context.Context, signedTransaction string) (subscription.State, error) {
 	var tx transaction
 	if err := g.verify.verify(signedTransaction, &tx); err != nil {
 		return subscription.State{}, fmt.Errorf("appstore: %w: %w", subscription.ErrUnverified, err)
@@ -137,46 +137,46 @@ func (g *Gateway) VerifyTransaction(ctx context.Context, signedTransaction strin
 	if tx.Type != "Auto-Renewable Subscription" {
 		return subscription.State{}, fmt.Errorf("appstore: %w: %s", subscription.ErrNotSubscription, tx.Type)
 	}
-	sub, err := g.Subscription(ctx, tx.OriginalTransactionID)
+	sub, err := g.current(ctx, tx.OriginalTransactionID)
 	if errors.Is(err, subscription.ErrUnavailable) {
 		return build(0, tx, renewal{AutoRenewStatus: 1}), nil
 	}
 	return sub, err
 }
 
-// ParseNotification verifies an App Store Server Notification V2 and returns its id and, for
-// subscription notifications, the subscription's state (an empty ProviderRef otherwise).
-func (g *Gateway) ParseNotification(_ context.Context, signedPayload string) (string, subscription.State, error) {
-	empty := subscription.State{Provider: subscription.AppStore}
+// notified verifies an App Store Server Notification V2 and returns the subscription it is about,
+// as the notification describes it; nil for test and other non-subscription notifications.
+func (g *Gateway) notified(signedPayload string) (*subscription.State, error) {
 	var n notification
 	if err := g.verify.verify(signedPayload, &n); err != nil {
-		return "", empty, fmt.Errorf("appstore: %w: %w", subscription.ErrInvalidNotification, err)
+		return nil, fmt.Errorf("appstore: %w: %w", subscription.ErrInvalidNotification, err)
 	}
 	if n.Data.BundleID != g.cfg.BundleID || (n.Data.Environment == "Production" && g.cfg.AppAppleID != 0 && n.Data.AppAppleID != g.cfg.AppAppleID) {
-		return "", empty, fmt.Errorf("appstore: %w: notification for another app", subscription.ErrInvalidNotification)
+		return nil, fmt.Errorf("appstore: %w: notification for another app", subscription.ErrInvalidNotification)
 	}
-	if n.Data.SignedTransactionInfo == "" { // TEST and other non-subscription notifications
-		return n.NotificationUUID, empty, nil
+	if n.Data.SignedTransactionInfo == "" {
+		return nil, nil
 	}
 	var tx transaction
 	if err := g.verify.verify(n.Data.SignedTransactionInfo, &tx); err != nil {
-		return "", empty, fmt.Errorf("appstore: %w: %w", subscription.ErrInvalidNotification, err)
+		return nil, fmt.Errorf("appstore: %w: %w", subscription.ErrInvalidNotification, err)
 	}
 	if tx.Type != "Auto-Renewable Subscription" {
-		return n.NotificationUUID, empty, nil
+		return nil, nil
 	}
 	r := renewal{AutoRenewStatus: 1}
 	if n.Data.SignedRenewalInfo != "" {
 		if err := g.verify.verify(n.Data.SignedRenewalInfo, &r); err != nil {
-			return "", empty, fmt.Errorf("appstore: %w: %w", subscription.ErrInvalidNotification, err)
+			return nil, fmt.Errorf("appstore: %w: %w", subscription.ErrInvalidNotification, err)
 		}
 	}
-	return n.NotificationUUID, build(n.Data.Status, tx, r), nil
+	state := build(n.Data.Status, tx, r)
+	return &state, nil
 }
 
-// Subscription fetches the status of a subscription. Apple asks servers to try production first
-// and fall back to the sandbox, which App Review and TestFlight purchases live in.
-func (g *Gateway) Subscription(ctx context.Context, originalTransactionID string) (subscription.State, error) {
+// current reads a subscription's status as the App Store has it now. Apple asks servers to try
+// production first and fall back to the sandbox, which App Review and TestFlight purchases live in.
+func (g *Gateway) current(ctx context.Context, originalTransactionID string) (subscription.State, error) {
 	for _, base := range []string{g.cfg.URL, g.cfg.SandboxURL} {
 		sub, found, err := g.status(ctx, base, originalTransactionID)
 		if err != nil || found {
@@ -276,12 +276,9 @@ func build(status int, tx transaction, r renewal) subscription.State {
 	return out
 }
 
-// Verify checks a StoreKit 2 signed transaction (subscription.Gateway).
-func (g *Gateway) Verify(ctx context.Context, proof string) (subscription.State, error) {
-	return g.VerifyTransaction(ctx, proof)
-}
-
-// Notification reads an App Store Server Notification V2 request (subscription.Gateway).
+// Notification verifies an App Store Server Notification V2 request and reads the subscription it
+// is about from the App Store; the notification's own copy stands only when the App Store no longer
+// knows the subscription (subscription.Gateway).
 func (g *Gateway) Notification(ctx context.Context, r *http.Request) (*subscription.State, error) {
 	var body struct {
 		SignedPayload string `json:"signedPayload"`
@@ -289,8 +286,15 @@ func (g *Gateway) Notification(ctx context.Context, r *http.Request) (*subscript
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil || body.SignedPayload == "" {
 		return nil, fmt.Errorf("appstore: %w: notification body", subscription.ErrMalformed)
 	}
-	_, state, err := g.ParseNotification(ctx, body.SignedPayload)
-	if err != nil || state.ProviderRef == "" {
+	notified, err := g.notified(body.SignedPayload)
+	if err != nil || notified == nil {
+		return nil, err
+	}
+	state, err := g.current(ctx, notified.ProviderRef)
+	switch {
+	case errors.Is(err, subscription.ErrNotFound):
+		return notified, nil
+	case err != nil:
 		return nil, err
 	}
 	return &state, nil

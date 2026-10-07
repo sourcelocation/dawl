@@ -11,36 +11,38 @@ import (
 	"time"
 )
 
-func TestEntitles(t *testing.T) {
+func TestUntil(t *testing.T) {
 	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
 	cases := []struct {
-		name   string
-		status Status
-		end    *time.Time
-		want   bool
+		name     string
+		state    State
+		until    *time.Time // nil: grants nothing
+		entitles bool
 	}{
-		{"active without an end", StatusActive, nil, true},
-		{"active in its period", StatusActive, at(time.Hour), true},
-		{"active renewal reported late", StatusActive, at(-48 * time.Hour), true},
-		{"active long past its period", StatusActive, at(-Grace - time.Second), false},
-		{"trialing", StatusTrialing, at(time.Hour), true},
-		{"in billing grace", StatusInGrace, at(-time.Hour), true},
-		{"canceled before its end", StatusCanceled, at(time.Hour), true},
-		{"canceled after its end", StatusCanceled, at(-time.Second), false},
-		{"canceled without an end", StatusCanceled, nil, false},
-		{"on hold", StatusOnHold, at(time.Hour), false},
-		{"paused", StatusPaused, at(time.Hour), false},
-		{"expired", StatusExpired, at(time.Hour), false},
-		{"revoked", StatusRevoked, at(time.Hour), false},
+		{"active and renewing", State{Status: StatusActive, AutoRenew: true, CurrentPeriodEnd: at(time.Hour)}, at(time.Hour + Grace), true},
+		{"renewal reported late", State{Status: StatusActive, AutoRenew: true, CurrentPeriodEnd: at(-48 * time.Hour)}, at(Grace - 48*time.Hour), true},
+		{"long past its period", State{Status: StatusActive, AutoRenew: true, CurrentPeriodEnd: at(-Grace - time.Second)}, at(-time.Second), false},
+		{"active, renewal off", State{Status: StatusActive, CurrentPeriodEnd: at(time.Hour)}, at(time.Hour), true},
+		{"active, renewal off, ended", State{Status: StatusActive, CurrentPeriodEnd: at(-time.Second)}, at(-time.Second), false},
+		{"trialing", State{Status: StatusTrialing, AutoRenew: true, CurrentPeriodEnd: at(time.Hour)}, at(time.Hour + Grace), true},
+		{"in billing grace", State{Status: StatusInGrace, CurrentPeriodEnd: at(-time.Hour)}, at(Grace - time.Hour), true},
+		{"canceled before its end", State{Status: StatusCanceled, CurrentPeriodEnd: at(time.Hour)}, at(time.Hour), true},
+		{"canceled after its end", State{Status: StatusCanceled, CurrentPeriodEnd: at(-time.Second)}, at(-time.Second), false},
+		{"without an end", State{Status: StatusActive, AutoRenew: true}, nil, false},
+		{"on hold", State{Status: StatusOnHold, CurrentPeriodEnd: at(time.Hour)}, nil, false},
+		{"paused", State{Status: StatusPaused, CurrentPeriodEnd: at(time.Hour)}, nil, false},
+		{"expired", State{Status: StatusExpired, CurrentPeriodEnd: at(time.Hour)}, nil, false},
+		{"revoked", State{Status: StatusRevoked, CurrentPeriodEnd: at(time.Hour)}, nil, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := Entitles(c.status, c.end, now); got != c.want {
-				t.Fatalf("Entitles = %v, want %v", got, c.want)
+			until, ok := c.state.Until()
+			if ok != (c.until != nil) || (ok && !until.Equal(*c.until)) {
+				t.Fatalf("Until = %v %v, want %v", until, ok, c.until)
 			}
-			if got := (State{Status: c.status, CurrentPeriodEnd: c.end}).Entitles(now); got != c.want {
-				t.Fatalf("State.Entitles = %v, want %v", got, c.want)
+			if got := c.state.Entitles(now); got != c.entitles {
+				t.Fatalf("Entitles = %v, want %v", got, c.entitles)
 			}
 		})
 	}

@@ -1,6 +1,6 @@
 // Package subscription is the vocabulary every store is translated into: where a subscription was
 // bought (Provider), where it stands (Status), its verified state as the store reports it (State),
-// and the rule that decides whether it grants access right now (Entitles).
+// and the one rule for how long it grants access (State.Until).
 //
 // It depends on the standard library only.
 package subscription
@@ -39,21 +39,9 @@ const (
 	StatusRevoked  Status = "revoked" // refunded or revoked by the store
 )
 
-// Grace keeps a subscription in good standing entitled for this long after its period ends, so a
-// renewal the store reports late never interrupts access.
+// Grace keeps a subscription that may still renew entitled for this long after its period ends, so
+// a renewal the store reports late never interrupts access.
 const Grace = 72 * time.Hour
-
-// Entitles reports whether a subscription with this status and period end grants access at now.
-func Entitles(status Status, periodEnd *time.Time, now time.Time) bool {
-	switch status {
-	case StatusActive, StatusTrialing, StatusInGrace:
-		return periodEnd == nil || now.Before(periodEnd.Add(Grace))
-	case StatusCanceled:
-		return periodEnd != nil && now.Before(*periodEnd)
-	default:
-		return false
-	}
-}
 
 // State is a subscription as a store reports it, already verified and normalised.
 type State struct {
@@ -70,8 +58,38 @@ type State struct {
 	Account string
 }
 
+// Until is when the subscription stops granting access; ok is false when it grants none. It is the
+// end of the period, plus Grace while the store may still renew it (active or trialing with
+// renewal on, or in billing grace). One without a period end grants nothing.
+//
+// Apps that keep "access until" rather than asking at every request store the latest Until of a
+// person's subscriptions. Subscriptions an app grants itself fit too: active, renewal off, ending
+// when the grant does.
+func (s State) Until() (until time.Time, ok bool) {
+	if s.CurrentPeriodEnd == nil {
+		return time.Time{}, false
+	}
+	end := *s.CurrentPeriodEnd
+	switch s.Status {
+	case StatusInGrace:
+		return end.Add(Grace), true
+	case StatusActive, StatusTrialing:
+		if s.AutoRenew {
+			return end.Add(Grace), true
+		}
+		return end, true
+	case StatusCanceled:
+		return end, true
+	default:
+		return time.Time{}, false
+	}
+}
+
 // Entitles reports whether the subscription grants access at now.
-func (s State) Entitles(now time.Time) bool { return Entitles(s.Status, s.CurrentPeriodEnd, now) }
+func (s State) Entitles(now time.Time) bool {
+	until, ok := s.Until()
+	return ok && now.Before(until)
+}
 
 // Gateway is what every store's gateway offers, so an app handles all stores the same way.
 type Gateway interface {
@@ -79,9 +97,19 @@ type Gateway interface {
 	// purchase token, a Stripe subscription id) and returns the subscription's verified state.
 	// Play purchases are acknowledged on the way.
 	Verify(ctx context.Context, proof string) (State, error)
-	// Notification verifies a store's notification and returns the subscription it is about,
-	// re-fetched where the store only sends a reference; nil for notifications about anything else.
+	// Notification verifies a store's notification and returns the subscription it is about, as
+	// the store has it now: stores deliver notifications late and out of order, so the gateway
+	// reads the subscription again rather than trusting the notification's copy. Saving what it
+	// returns is therefore safe in any order and any number of times. Nil for notifications about
+	// anything else.
 	Notification(ctx context.Context, r *http.Request) (*State, error)
+}
+
+// Renewer is a gateway that can turn a subscription's renewal off and on again from the server,
+// keeping the period already paid for. Stripe's can; the App Store's and Play's leave that to the
+// person, in their store.
+type Renewer interface {
+	SetAutoRenew(ctx context.Context, ref string, on bool) error
 }
 
 // Webhook serves a store's notifications: each verified subscription goes to save. Requests that

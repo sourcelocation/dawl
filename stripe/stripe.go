@@ -1,5 +1,5 @@
 // Package stripe is the Stripe gateway for web subscriptions: Checkout to subscribe, the customer
-// portal to manage, webhooks to stay in sync.
+// portal to manage, webhooks to stay in sync, and renewal turned off and on from the server.
 //
 // The Stripe webhook endpoint must be created with the API version this SDK pins (sgo.APIVersion);
 // events of other versions are rejected rather than misread.
@@ -55,15 +55,6 @@ func New(cfg Config) *Gateway {
 	return &Gateway{cfg: cfg, client: sgo.NewClient(cfg.SecretKey, sgo.WithBackends(sgo.NewBackendsWithConfig(backend)))}
 }
 
-// Webhook is a verified Stripe event.
-type Webhook struct {
-	EventID string
-	// Subscription is the subscription's full state for subscription events, nil for every other
-	// event (they are acknowledged and ignored).
-	Subscription *subscription.State
-	Customer     string
-}
-
 // EnsureCustomer returns a live customer for the account, creating one when needed. email may be
 // empty: Checkout then asks for it.
 func (g *Gateway) EnsureCustomer(ctx context.Context, account, email, existing string) (string, error) {
@@ -111,6 +102,13 @@ func (g *Gateway) CheckoutURL(ctx context.Context, customer, account, price stri
 	return s.URL, nil
 }
 
+// SetCustomerEmail changes where Stripe sends the customer's receipts and invoices, as when the
+// account's email changes.
+func (g *Gateway) SetCustomerEmail(ctx context.Context, customer, email string) error {
+	_, err := g.client.V1Customers.Update(ctx, customer, &sgo.CustomerUpdateParams{Email: sgo.String(email)})
+	return gatewayError(err)
+}
+
 // PortalURL opens the customer portal (payment method, invoices, cancel).
 func (g *Gateway) PortalURL(ctx context.Context, customer string) (string, error) {
 	s, err := g.client.V1BillingPortalSessions.Create(ctx, &sgo.BillingPortalSessionCreateParams{
@@ -122,8 +120,8 @@ func (g *Gateway) PortalURL(ctx context.Context, customer string) (string, error
 	return s.URL, nil
 }
 
-// subscriptionEvents carry the subscription's full state; everything else is acknowledged and
-// ignored (invoice events always come with a matching subscription update).
+// subscriptionEvents are about a subscription; everything else is acknowledged and ignored (invoice
+// events always come with a matching subscription update).
 var subscriptionEvents = map[sgo.EventType]bool{
 	"customer.subscription.created":                true,
 	"customer.subscription.updated":                true,
@@ -134,29 +132,27 @@ var subscriptionEvents = map[sgo.EventType]bool{
 	"customer.subscription.pending_update_expired": true,
 }
 
-// ParseWebhook verifies the Stripe-Signature header and decodes subscription events.
-func (g *Gateway) ParseWebhook(payload []byte, signature string) (Webhook, error) {
+// subscriptionID verifies the Stripe-Signature header and returns the id of the subscription the
+// event is about; empty for other events.
+func (g *Gateway) subscriptionID(payload []byte, signature string) (string, error) {
 	event, err := webhook.ConstructEvent(payload, signature, g.cfg.WebhookSecret)
 	if err != nil {
-		return Webhook{}, fmt.Errorf("stripe: %w: %w", subscription.ErrInvalidNotification, err)
+		return "", fmt.Errorf("stripe: %w: %w", subscription.ErrInvalidNotification, err)
 	}
 	if !subscriptionEvents[event.Type] {
-		return Webhook{EventID: event.ID}, nil
+		return "", nil
 	}
-	var sub sgo.Subscription
-	if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
-		return Webhook{}, fmt.Errorf("stripe: %w: %w", subscription.ErrMalformed, err)
+	var sub struct {
+		ID string `json:"id"`
 	}
-	customer := ""
-	if sub.Customer != nil {
-		customer = sub.Customer.ID
+	if err := json.Unmarshal(event.Data.Raw, &sub); err != nil || sub.ID == "" {
+		return "", fmt.Errorf("stripe: %w: subscription event without a subscription", subscription.ErrMalformed)
 	}
-	state := g.toState(&sub)
-	return Webhook{EventID: event.ID, Subscription: &state, Customer: customer}, nil
+	return sub.ID, nil
 }
 
-// Subscription fetches the current state of a subscription.
-func (g *Gateway) Subscription(ctx context.Context, ref string) (subscription.State, error) {
+// current reads a subscription as Stripe has it now.
+func (g *Gateway) current(ctx context.Context, ref string) (subscription.State, error) {
 	sub, err := g.client.V1Subscriptions.Retrieve(ctx, ref, nil)
 	if err != nil {
 		return subscription.State{}, gatewayError(err)
@@ -164,27 +160,14 @@ func (g *Gateway) Subscription(ctx context.Context, ref string) (subscription.St
 	return g.toState(sub), nil
 }
 
-// SetCancelAtPeriodEnd stops (or resumes) renewal while keeping the paid period.
-func (g *Gateway) SetCancelAtPeriodEnd(ctx context.Context, ref string, cancel bool) error {
-	_, err := g.client.V1Subscriptions.Update(ctx, ref, &sgo.SubscriptionUpdateParams{CancelAtPeriodEnd: sgo.Bool(cancel)})
+// SetAutoRenew turns renewal off or on again, keeping the period already paid for
+// (subscription.Renewer).
+func (g *Gateway) SetAutoRenew(ctx context.Context, ref string, on bool) error {
+	_, err := g.client.V1Subscriptions.Update(ctx, ref, &sgo.SubscriptionUpdateParams{CancelAtPeriodEnd: sgo.Bool(!on)})
 	return gatewayError(err)
 }
 
-// CancelSubscription ends a subscription immediately without a final invoice. Cancelling one that
-// is already over succeeds.
-func (g *Gateway) CancelSubscription(ctx context.Context, ref string) error {
-	_, err := g.client.V1Subscriptions.Cancel(ctx, ref, &sgo.SubscriptionCancelParams{InvoiceNow: sgo.Bool(false), Prorate: sgo.Bool(false)})
-	if err == nil || isMissing(err) {
-		return nil
-	}
-	if sub, getErr := g.client.V1Subscriptions.Retrieve(ctx, ref, nil); getErr == nil &&
-		(sub.Status == sgo.SubscriptionStatusCanceled || sub.Status == sgo.SubscriptionStatusIncompleteExpired) {
-		return nil
-	}
-	return gatewayError(err)
-}
-
-// DeleteCustomer removes the customer and its payment methods.
+// DeleteCustomer removes the customer and its payment methods, which ends its subscriptions.
 func (g *Gateway) DeleteCustomer(ctx context.Context, customer string) error {
 	_, err := g.client.V1Customers.Delete(ctx, customer, nil)
 	if isMissing(err) {
@@ -263,18 +246,23 @@ func gatewayError(err error) error {
 
 // Verify reads a subscription by id (subscription.Gateway).
 func (g *Gateway) Verify(ctx context.Context, proof string) (subscription.State, error) {
-	return g.Subscription(ctx, proof)
+	return g.current(ctx, proof)
 }
 
-// Notification verifies a webhook request by its Stripe-Signature (subscription.Gateway).
-func (g *Gateway) Notification(_ context.Context, r *http.Request) (*subscription.State, error) {
+// Notification verifies a webhook request by its Stripe-Signature and reads the subscription it is
+// about from Stripe (subscription.Gateway).
+func (g *Gateway) Notification(ctx context.Context, r *http.Request) (*subscription.State, error) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("stripe: %w: %w", subscription.ErrMalformed, err)
 	}
-	hook, err := g.ParseWebhook(body, r.Header.Get("Stripe-Signature"))
+	ref, err := g.subscriptionID(body, r.Header.Get("Stripe-Signature"))
+	if err != nil || ref == "" {
+		return nil, err
+	}
+	state, err := g.current(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	return hook.Subscription, nil
+	return &state, nil
 }

@@ -1,9 +1,14 @@
 package stripe
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -46,7 +51,21 @@ func stripeSubscription(status string, cancelAtPeriodEnd bool, periodEnd int64) 
 	}
 }
 
-func TestWebhookDecodesSubscriptionState(t *testing.T) {
+// decode reads a subscription as Stripe's API returns it.
+func decode(t *testing.T, object map[string]any) *sgo.Subscription {
+	t.Helper()
+	raw, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sub sgo.Subscription
+	if err := json.Unmarshal(raw, &sub); err != nil {
+		t.Fatal(err)
+	}
+	return &sub
+}
+
+func TestStatesAreNormalised(t *testing.T) {
 	end := time.Date(2027, 10, 2, 0, 0, 0, 0, time.UTC).Unix()
 	cases := []struct {
 		status    string
@@ -66,15 +85,7 @@ func TestWebhookDecodesSubscriptionState(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s/ending=%v", c.status, c.ending), func(t *testing.T) {
-			payload, header := event(t, "customer.subscription.updated", stripeSubscription(c.status, c.ending, end))
-			hook, err := gateway().ParseWebhook(payload, header)
-			if err != nil {
-				t.Fatal(err)
-			}
-			sub := hook.Subscription
-			if hook.EventID != "evt_1" || hook.Customer != "cus_1" || sub == nil {
-				t.Fatalf("hook = %+v", hook)
-			}
+			sub := gateway().toState(decode(t, stripeSubscription(c.status, c.ending, end)))
 			if sub.Provider != subscription.Stripe || sub.Status != c.want || sub.AutoRenew != c.autoRenew || sub.ProviderRef != "sub_1" || sub.ProductID != "price_yearly" {
 				t.Fatalf("sub = %+v", sub)
 			}
@@ -88,19 +99,87 @@ func TestWebhookDecodesSubscriptionState(t *testing.T) {
 	}
 }
 
-func TestWebhookRejectsForgedSignatures(t *testing.T) {
-	payload, _ := event(t, "customer.subscription.updated", stripeSubscription("active", false, 1))
+// fakeStripe answers for subscription sub_1 and customer cus_1, and remembers what it was asked to
+// change.
+type fakeStripe struct {
+	status string // what Stripe has now
+	reads  int
+	form   url.Values
+}
+
+func newFake(t *testing.T) (*Gateway, *fakeStripe) {
+	t.Helper()
+	f := &fakeStripe{status: "active"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch {
+		case r.URL.Path == "/v1/subscriptions/sub_1" && r.Method == http.MethodGet:
+			f.reads++
+			_ = json.NewEncoder(w).Encode(stripeSubscription(f.status, false, time.Now().Add(time.Hour).Unix()))
+		case r.URL.Path == "/v1/subscriptions/sub_1" && r.Method == http.MethodPost:
+			f.form = r.PostForm
+			_ = json.NewEncoder(w).Encode(stripeSubscription(f.status, r.PostForm.Get("cancel_at_period_end") == "true", 1))
+		case r.URL.Path == "/v1/customers/cus_1" && r.Method == http.MethodPost:
+			f.form = r.PostForm
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "cus_1", "object": "customer"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"type": "invalid_request_error", "code": "resource_missing"}})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(Config{SecretKey: "sk_test_x", WebhookSecret: secret, AccountMetadataKey: "app_account", APIBase: srv.URL}), f
+}
+
+func notification(t *testing.T, payload []byte, signature string) *http.Request {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/webhooks/stripe", bytes.NewReader(payload))
+	r.Header.Set("Stripe-Signature", signature)
+	return r
+}
+
+func TestNotificationsReadTheSubscriptionAgain(t *testing.T) {
+	gw, store := newFake(t)
+	ctx := context.Background()
+	// An update that arrives after the subscription was canceled: Stripe's answer wins.
+	store.status = "canceled"
+	payload, header := event(t, "customer.subscription.updated", stripeSubscription("active", false, time.Now().Add(time.Hour).Unix()))
+	sub, err := gw.Notification(ctx, notification(t, payload, header))
+	if err != nil || sub == nil || sub.Status != subscription.StatusExpired || store.reads != 1 {
+		t.Fatalf("sub=%+v err=%v reads=%d", sub, err, store.reads)
+	}
+
+	payload, header = event(t, "invoice.paid", map[string]any{"id": "in_1", "object": "invoice"})
+	if sub, err := gw.Notification(ctx, notification(t, payload, header)); err != nil || sub != nil || store.reads != 1 {
+		t.Fatalf("other events are acknowledged without reading anything: %+v %v", sub, err)
+	}
+
 	forged := webhook.GenerateTestSignedPayload(&webhook.UnsignedPayload{Payload: payload, Secret: "whsec_attacker"})
-	if _, err := gateway().ParseWebhook(payload, forged.Header); !errors.Is(err, subscription.ErrInvalidNotification) {
-		t.Fatalf("err = %v", err)
+	if _, err := gw.Notification(ctx, notification(t, payload, forged.Header)); !errors.Is(err, subscription.ErrInvalidNotification) {
+		t.Fatalf("forged: %v", err)
+	}
+
+	payload, header = event(t, "customer.subscription.deleted", map[string]any{"id": "sub_gone", "object": "subscription"})
+	if _, err := gw.Notification(ctx, notification(t, payload, header)); !errors.Is(err, subscription.ErrNotFound) {
+		t.Fatalf("a subscription Stripe doesn't know: %v", err)
 	}
 }
 
-func TestOtherEventsAreAcknowledgedWithoutState(t *testing.T) {
-	payload, header := event(t, "invoice.paid", map[string]any{"id": "in_1", "object": "invoice"})
-	hook, err := gateway().ParseWebhook(payload, header)
-	if err != nil || hook.EventID != "evt_1" || hook.Subscription != nil {
-		t.Fatalf("hook=%+v err=%v", hook, err)
+func TestRenewalAndEmailChanges(t *testing.T) {
+	gw, store := newFake(t)
+	ctx := context.Background()
+	var _ subscription.Renewer = gw
+	if err := gw.SetAutoRenew(ctx, "sub_1", false); err != nil || store.form.Get("cancel_at_period_end") != "true" {
+		t.Fatalf("off: %v %v", err, store.form)
+	}
+	if err := gw.SetAutoRenew(ctx, "sub_1", true); err != nil || store.form.Get("cancel_at_period_end") != "false" {
+		t.Fatalf("on: %v %v", err, store.form)
+	}
+	if err := gw.SetCustomerEmail(ctx, "cus_1", "new@example.com"); err != nil || store.form.Get("email") != "new@example.com" {
+		t.Fatalf("email: %v %v", err, store.form)
+	}
+	if err := gw.SetAutoRenew(ctx, "sub_gone", false); !errors.Is(err, subscription.ErrNotFound) {
+		t.Fatalf("unknown subscription: %v", err)
 	}
 }
 

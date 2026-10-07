@@ -1,27 +1,39 @@
 # dawl
 
-Subscriptions from every store, in one vocabulary. dawl verifies what Stripe, the App Store and Google Play report about a subscription and normalises it into a single `subscription.State`, with one rule for whether it grants access right now.
+Subscriptions from every store, in one vocabulary. dawl verifies what Stripe, the App Store and Google Play report about a subscription and normalises it into a single `subscription.State`, with one rule for how long it grants access.
 
 It is the store-facing half of billing, shared by [Rondo](https://github.com/sourcelocation/rondo) and [Invaris](https://github.com/sourcelocation/invaris). Plans, limits, storage and what an app does when a plan changes stay in each app.
 
 | Package | What it does |
 | --- | --- |
-| [`subscription`](subscription) | `Provider`, `Status`, `State`, `Entitles` and the errors gateways return. Standard library only, so apps can use it from their domain layer. |
-| [`stripe`](stripe) | Customers, Checkout, the customer portal, webhook verification, subscription state, cancellation. |
+| [`subscription`](subscription) | `Provider`, `Status`, `State` with `Until` and `Entitles`, the `Gateway` and `Renewer` interfaces, `Webhook`, and the errors gateways return. Standard library only, so apps can use it from their domain layer. |
+| [`stripe`](stripe) | Customers, Checkout, the customer portal, webhook verification, subscription state, renewal off and on. |
 | [`appstore`](appstore) | StoreKit 2 transactions and App Store Server Notifications V2, verified against Apple's root certificate; subscription status from the App Store Server API (production, then sandbox). |
 | [`googleplay`](googleplay) | Subscription state and acknowledgement from the Android Publisher API; Real-time Developer Notifications verified from their Pub/Sub push. |
 
 Every gateway is a `subscription.Gateway`: `Verify` checks proof from an app's purchase, and
-`Notification` reads a store's notification. `subscription.Webhook` serves notifications for any of them:
+`Notification` reads a store's notification. Stores deliver notifications late and out of order, so
+`Notification` always returns the subscription as the store has it now: saving it is safe in any
+order. `subscription.Webhook` serves notifications for any gateway:
 
 ```go
 var gw subscription.Gateway = stripe.New(stripe.Config{SecretKey: key, WebhookSecret: whsec, AccountMetadataKey: "app_account"})
 
 http.Handle("POST /webhooks/stripe", subscription.Webhook(gw, func(ctx context.Context, s subscription.State) error {
-	return save(ctx, s.Account, s) // then: s.Entitles(time.Now())
+	return save(ctx, s.Account, s) // then: s.Until() or s.Entitles(time.Now())
 }))
 
 state, err := appStore.Verify(ctx, signedTransaction) // from StoreKit 2, in an app's request
+```
+
+`State.Until` is when a subscription stops granting access: its period end, plus `subscription.Grace` while the store may still renew it. An app that keeps "access until" stores the latest `Until` of a person's subscriptions; access it grants itself (gifts, codes) fits as an active subscription with renewal off.
+
+A gateway that can turn renewal off and on from the server is also a `subscription.Renewer` (Stripe's is; the App Store and Google Play leave that to the person):
+
+```go
+if r, ok := gw.(subscription.Renewer); ok {
+	err = r.SetAutoRenew(ctx, state.ProviderRef, false) // the paid period stays
+}
 ```
 
 Every gateway wraps failures in one of the `subscription.Err*` values (`ErrUnverified`, `ErrNotSubscription`, `ErrInvalidNotification`, `ErrMalformed`, `ErrNotFound`, `ErrUnavailable`), so an app maps them onto its own errors with `errors.Is`. `State.Account` is the app's account id as the store carries it (Stripe metadata, `appAccountToken`, `obfuscatedExternalAccountId`); dawl never interprets it.

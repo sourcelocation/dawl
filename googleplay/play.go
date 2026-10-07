@@ -75,8 +75,8 @@ type subscriptionV2 struct {
 	} `json:"externalAccountIdentifiers"`
 }
 
-// VerifySubscription reads a subscription by purchase token (purchases.subscriptionsv2.get).
-func (g *Gateway) VerifySubscription(ctx context.Context, purchaseToken string) (subscription.State, error) {
+// current reads a subscription by purchase token as Play has it now (purchases.subscriptionsv2.get).
+func (g *Gateway) current(ctx context.Context, purchaseToken string) (subscription.State, error) {
 	var sub subscriptionV2
 	status, err := g.call(ctx, http.MethodGet, "/purchases/subscriptionsv2/tokens/"+url.PathEscape(purchaseToken), nil, &sub)
 	switch {
@@ -90,8 +90,8 @@ func (g *Gateway) VerifySubscription(ctx context.Context, purchaseToken string) 
 	return toState(purchaseToken, sub), nil
 }
 
-// Acknowledge confirms a purchase; Play refunds purchases left unacknowledged for three days.
-func (g *Gateway) Acknowledge(ctx context.Context, purchaseToken, productID string) error {
+// acknowledge confirms a purchase; Play refunds purchases left unacknowledged for three days.
+func (g *Gateway) acknowledge(ctx context.Context, purchaseToken, productID string) error {
 	path := "/purchases/subscriptions/" + url.PathEscape(productID) + "/tokens/" + url.PathEscape(purchaseToken) + ":acknowledge"
 	status, err := g.call(ctx, http.MethodPost, path, map[string]any{}, nil)
 	if err != nil {
@@ -142,13 +142,13 @@ func (g *Gateway) call(ctx context.Context, method, path string, body, out any) 
 	return res.StatusCode, nil
 }
 
-// ParseNotification verifies a Pub/Sub push (Google-signed OIDC token) and returns the message id
-// and the purchase token of a subscription or voided-purchase notification (empty for test and
-// one-time-product notifications).
-func (g *Gateway) ParseNotification(ctx context.Context, authorization string, body []byte) (string, string, error) {
+// purchaseToken verifies a Pub/Sub push (Google-signed OIDC token) and returns the purchase token
+// of a subscription or voided-purchase notification (empty for test and one-time-product
+// notifications).
+func (g *Gateway) purchaseToken(ctx context.Context, authorization string, body []byte) (string, error) {
 	token, ok := strings.CutPrefix(authorization, "Bearer ")
 	if !ok {
-		return "", "", fmt.Errorf("googleplay: %w: no bearer token", subscription.ErrInvalidNotification)
+		return "", fmt.Errorf("googleplay: %w: no bearer token", subscription.ErrInvalidNotification)
 	}
 	var claims struct {
 		jwt.RegisteredClaims
@@ -157,10 +157,10 @@ func (g *Gateway) ParseNotification(ctx context.Context, authorization string, b
 	}
 	if _, err := jwt.ParseWithClaims(token, &claims, g.certs.Keyfunc(ctx),
 		jwt.WithValidMethods([]string{"RS256"}), jwt.WithAudience(g.cfg.PubSubAudience), jwt.WithExpirationRequired(), jwt.WithLeeway(time.Minute)); err != nil {
-		return "", "", fmt.Errorf("googleplay: %w: %w", subscription.ErrInvalidNotification, err)
+		return "", fmt.Errorf("googleplay: %w: %w", subscription.ErrInvalidNotification, err)
 	}
 	if (claims.Issuer != "https://accounts.google.com" && claims.Issuer != "accounts.google.com") || !claims.EmailVerified || claims.Email != g.cfg.PubSubAccount {
-		return "", "", fmt.Errorf("googleplay: %w: pushed by %q", subscription.ErrInvalidNotification, claims.Email)
+		return "", fmt.Errorf("googleplay: %w: pushed by %q", subscription.ErrInvalidNotification, claims.Email)
 	}
 	var push struct {
 		Message struct {
@@ -169,11 +169,11 @@ func (g *Gateway) ParseNotification(ctx context.Context, authorization string, b
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(body, &push); err != nil || push.Message.MessageID == "" {
-		return "", "", fmt.Errorf("googleplay: %w: push envelope", subscription.ErrMalformed)
+		return "", fmt.Errorf("googleplay: %w: push envelope", subscription.ErrMalformed)
 	}
 	raw, err := base64.StdEncoding.DecodeString(push.Message.Data)
 	if err != nil {
-		return "", "", fmt.Errorf("googleplay: %w: %w", subscription.ErrMalformed, err)
+		return "", fmt.Errorf("googleplay: %w: %w", subscription.ErrMalformed, err)
 	}
 	var n struct {
 		PackageName              string `json:"packageName"`
@@ -186,18 +186,18 @@ func (g *Gateway) ParseNotification(ctx context.Context, authorization string, b
 		} `json:"voidedPurchaseNotification"`
 	}
 	if err := json.Unmarshal(raw, &n); err != nil {
-		return "", "", fmt.Errorf("googleplay: %w: %w", subscription.ErrMalformed, err)
+		return "", fmt.Errorf("googleplay: %w: %w", subscription.ErrMalformed, err)
 	}
 	if n.PackageName != g.cfg.PackageName {
-		return "", "", fmt.Errorf("googleplay: %w: notification for %q", subscription.ErrInvalidNotification, n.PackageName)
+		return "", fmt.Errorf("googleplay: %w: notification for %q", subscription.ErrInvalidNotification, n.PackageName)
 	}
 	switch {
 	case n.SubscriptionNotification != nil:
-		return push.Message.MessageID, n.SubscriptionNotification.PurchaseToken, nil
+		return n.SubscriptionNotification.PurchaseToken, nil
 	case n.VoidedPurchaseNotification != nil && n.VoidedPurchaseNotification.ProductType == 1:
-		return push.Message.MessageID, n.VoidedPurchaseNotification.PurchaseToken, nil
+		return n.VoidedPurchaseNotification.PurchaseToken, nil
 	default: // test and one-time-product notifications
-		return push.Message.MessageID, "", nil
+		return "", nil
 	}
 }
 
@@ -241,12 +241,12 @@ func toState(token string, s subscriptionV2) subscription.State {
 
 // Verify reads a subscription by purchase token and acknowledges it (subscription.Gateway).
 func (g *Gateway) Verify(ctx context.Context, proof string) (subscription.State, error) {
-	state, err := g.VerifySubscription(ctx, proof)
+	state, err := g.current(ctx, proof)
 	if err != nil {
 		return state, err
 	}
 	if state.Entitles(time.Now()) {
-		if err := g.Acknowledge(ctx, proof, state.ProductID); err != nil {
+		if err := g.acknowledge(ctx, proof, state.ProductID); err != nil {
 			return state, err
 		}
 	}
@@ -260,11 +260,11 @@ func (g *Gateway) Notification(ctx context.Context, r *http.Request) (*subscript
 	if err != nil {
 		return nil, fmt.Errorf("googleplay: %w: %w", subscription.ErrMalformed, err)
 	}
-	_, token, err := g.ParseNotification(ctx, r.Header.Get("Authorization"), body)
+	token, err := g.purchaseToken(ctx, r.Header.Get("Authorization"), body)
 	if err != nil || token == "" {
 		return nil, err
 	}
-	state, err := g.VerifySubscription(ctx, token)
+	state, err := g.current(ctx, token)
 	if err != nil {
 		return nil, err
 	}
