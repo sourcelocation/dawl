@@ -1,6 +1,6 @@
 // Package subscription is the vocabulary every store is translated into: where a subscription was
 // bought (Provider), where it stands (Status), its verified state as the store reports it (State),
-// and the one rule for how long it grants access (State.Until).
+// the one rule for how long it grants access (State.Until), and what products cost (Price).
 //
 // It depends on the standard library only.
 package subscription
@@ -20,6 +20,7 @@ const (
 	Stripe     Provider = "stripe"
 	AppStore   Provider = "app_store"
 	GooglePlay Provider = "google_play"
+	Discord    Provider = "discord"
 )
 
 // Status normalises the lifecycle states of every store into one vocabulary.
@@ -43,6 +44,10 @@ const (
 // a renewal the store reports late never interrupts access.
 const Grace = 72 * time.Hour
 
+// Forever is the period end of access a store grants with no end set yet: a Discord entitlement
+// runs until Discord ends it. It fits a database's timestamp, so apps store it like any other end.
+var Forever = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
+
 // State is a subscription as a store reports it, already verified and normalised.
 type State struct {
 	Provider         Provider
@@ -53,14 +58,19 @@ type State struct {
 	AutoRenew        bool
 	Environment      string // production | sandbox
 	// Account is the app's account the purchase was made for, as the store reports it: Stripe
-	// metadata, the App Store's appAccountToken or Play's obfuscatedExternalAccountId. Empty when
-	// the store does not say.
+	// metadata, the App Store's appAccountToken, Play's obfuscatedExternalAccountId or the Discord
+	// user who bought it. Empty when the store does not say.
 	Account string
+	// Covers is what the subscription grants access to when that is something other than Account,
+	// as the store reports it: a Discord guild subscription covers its server. Empty when it covers
+	// Account. Like Account, dawl never interprets it.
+	Covers string
 }
 
 // Until is when the subscription stops granting access; ok is false when it grants none. It is the
 // end of the period, plus Grace while the store may still renew it (active or trialing with
-// renewal on, or in billing grace). One without a period end grants nothing.
+// renewal on, or in billing grace), and never past Forever. One without a period end grants
+// nothing.
 //
 // Apps that keep "access until" rather than asking at every request store the latest Until of a
 // person's subscriptions. Subscriptions an app grants itself fit too: active, renewal off, ending
@@ -70,12 +80,16 @@ func (s State) Until() (until time.Time, ok bool) {
 		return time.Time{}, false
 	}
 	end := *s.CurrentPeriodEnd
+	graced := end.Add(Grace)
+	if graced.After(Forever) {
+		graced = Forever
+	}
 	switch s.Status {
 	case StatusInGrace:
-		return end.Add(Grace), true
+		return graced, true
 	case StatusActive, StatusTrialing:
 		if s.AutoRenew {
-			return end.Add(Grace), true
+			return graced, true
 		}
 		return end, true
 	case StatusCanceled:
@@ -103,6 +117,33 @@ type Gateway interface {
 	// returns is therefore safe in any order and any number of times. Nil for notifications about
 	// anything else.
 	Notification(ctx context.Context, r *http.Request) (*State, error)
+}
+
+// Interval is how often a price is charged.
+type Interval string
+
+// The intervals stores charge at.
+const (
+	Day   Interval = "day"
+	Week  Interval = "week"
+	Month Interval = "month"
+	Year  Interval = "year"
+)
+
+// Price is what a product costs, as its store lists it.
+type Price struct {
+	ProductID string
+	Amount    int64  // in the currency's smallest unit (cents)
+	Currency  string // ISO 4217, upper case: "USD"
+	Interval  Interval
+	Every     int // charged every Every intervals: 3 with Month is quarterly
+}
+
+// Catalog is a gateway that can say what its products cost, for an app to show before someone
+// buys. Stripe's can; the App Store, Play and Discord show their own prices where people buy.
+type Catalog interface {
+	// Prices reads the prices of products by their store ids, in the same order.
+	Prices(ctx context.Context, productIDs ...string) ([]Price, error)
 }
 
 // Renewer is a gateway that can turn a subscription's renewal off and on again from the server,
@@ -135,6 +176,7 @@ func Webhook(gw Gateway, save func(context.Context, State) error) http.Handler {
 				return
 			}
 		}
+		w.Header().Set("Content-Type", "application/json") // Discord wants one even on an empty answer
 		w.WriteHeader(http.StatusNoContent)
 	})
 }

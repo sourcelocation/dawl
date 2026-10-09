@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	sgo "github.com/stripe/stripe-go/v87"
@@ -165,6 +166,22 @@ func (g *Gateway) current(ctx context.Context, ref string) (subscription.State, 
 func (g *Gateway) SetAutoRenew(ctx context.Context, ref string, on bool) error {
 	_, err := g.client.V1Subscriptions.Update(ctx, ref, &sgo.SubscriptionUpdateParams{CancelAtPeriodEnd: sgo.Bool(!on)})
 	return gatewayError(err)
+}
+
+// Prices reads what prices cost, by their ids (subscription.Catalog).
+func (g *Gateway) Prices(ctx context.Context, ids ...string) ([]subscription.Price, error) {
+	out := make([]subscription.Price, len(ids))
+	for i, id := range ids {
+		p, err := g.client.V1Prices.Retrieve(ctx, id, nil)
+		if err != nil {
+			return nil, gatewayError(err)
+		}
+		out[i] = subscription.Price{ProductID: p.ID, Amount: p.UnitAmount, Currency: strings.ToUpper(string(p.Currency))}
+		if p.Recurring != nil {
+			out[i].Interval, out[i].Every = subscription.Interval(p.Recurring.Interval), int(p.Recurring.IntervalCount)
+		}
+	}
+	return out, nil
 }
 
 // DeleteCustomer removes the customer and its payment methods, which ends its subscriptions.
