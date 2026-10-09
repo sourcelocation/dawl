@@ -1,13 +1,15 @@
 name: CI
 
+# Release pull requests into production carry master's latest commit, which this already tested.
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
+    branches-ignore: [production]
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:
   contents: read
