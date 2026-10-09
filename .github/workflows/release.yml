@@ -3,8 +3,9 @@ name: Release
 # A release is a pull request from master into production, titled with the version it releases
 # (v1.2.3); its description becomes the release notes. "Release version" checks the pull request:
 # it comes from master, its title is a version not released yet, and CI passed on its commit.
-# Merging it tags the merge commit and publishes the GitHub release. A released tag never moves:
-# the repository's rulesets let nobody move or delete a v* tag.
+# Merging it tags the merge commit and publishes the GitHub release. Only this workflow creates v*
+# tags, and none ever moves: the repository's rulesets let only its deploy key, whose private half
+# lives in the release environment, create one, and nobody move or delete one.
 on:
   pull_request:
     branches: [production]
@@ -83,10 +84,14 @@ jobs:
     if: github.event_name == 'push'
     needs: version
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
       pull-requests: read
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ssh-key: ${{ secrets.RELEASE_TAG_KEY }}
       - name: Tag it and publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -94,8 +99,10 @@ jobs:
           PR: ${{ needs.version.outputs.pr }}
         run: |
           set -euo pipefail
-          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
       # So `go get` finds the version at once rather than whenever the proxy next looks.
       - name: Announce it to the Go module proxy
         env:
