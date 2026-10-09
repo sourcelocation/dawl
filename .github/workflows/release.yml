@@ -66,7 +66,7 @@ jobs:
             run=""
             for _ in $(seq 1 120); do
               run=$(gh run list --workflow ci.yml --commit "$sha" --event push --limit 1 --json status,conclusion --jq '.[0] // empty')
-              [ -z "$run" ] || [ "$(jq -r .status <<<"$run")" = completed ] && break
+              if [ -n "$run" ] && [ "$(jq -r .status <<<"$run")" = completed ]; then break; fi
               sleep 15
             done
             if [ -z "$run" ] || [ "$(jq -r .conclusion <<<"$run")" != success ]; then
