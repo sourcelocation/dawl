@@ -1,0 +1,103 @@
+name: Release
+
+# A release is a pull request from master into production, titled with the version it releases
+# (v1.2.3); its description becomes the release notes. "Release version" checks the pull request:
+# it comes from master, its title is a version not released yet, and CI passed on its commit.
+# Merging it tags the merge commit and publishes the GitHub release. A released tag never moves:
+# the repository's rulesets let nobody move or delete a v* tag.
+on:
+  pull_request:
+    branches: [production]
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [production]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.pull_request.number || 'production' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    name: Release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      pr: ${{ steps.version.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            pr=$(jq '.pull_request' "$GITHUB_EVENT_PATH")
+          else
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+              --jq "[.[] | select(.base.ref == \"production\" and .merged_at != null)][0]")
+          fi
+          if [ -z "$pr" ] || [ "$pr" = null ]; then
+            echo "::error::production only changes through a release pull request."; exit 1
+          fi
+          tag=$(jq -r '.title' <<<"$pr")
+          sha=$(jq -r '.head.sha' <<<"$pr")
+          from=$(jq -r '.head.repo.full_name + ":" + .head.ref' <<<"$pr")
+          if [ "$from" != "$GITHUB_REPOSITORY:$DEFAULT_BRANCH" ]; then
+            echo "::error::A release comes from $DEFAULT_BRANCH, not $from."; exit 1
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::The title is the version it releases, like v1.2.3, not \"$tag\"."; exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --silent 2>/dev/null; then
+            echo "::error::$tag is released already."; exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The release is what master's CI tested: wait for it on this commit.
+            run=""
+            for _ in $(seq 1 120); do
+              run=$(gh run list --workflow ci.yml --commit "$sha" --event push --limit 1 --json status,conclusion --jq '.[0] // empty')
+              [ -z "$run" ] || [ "$(jq -r .status <<<"$run")" = completed ] && break
+              sleep 15
+            done
+            if [ -z "$run" ] || [ "$(jq -r .conclusion <<<"$run")" != success ]; then
+              echo "::error::CI didn't pass on master at ${sha:0:7}."; exit 1
+            fi
+          fi
+          {
+            echo "tag=$tag"
+            echo "pr=$(jq -r '.number' <<<"$pr")"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release
+    if: github.event_name == 'push'
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Tag it and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          PR: ${{ needs.version.outputs.pr }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+      # So `go get` finds the version at once rather than whenever the proxy next looks.
+      - name: Announce it to the Go module proxy
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: curl -fsS --retry 5 --retry-all-errors "https://proxy.golang.org/github.com/sourcelocation/dawl/@v/$TAG.info"
