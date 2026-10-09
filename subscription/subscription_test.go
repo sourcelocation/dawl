@@ -30,6 +30,8 @@ func TestUntil(t *testing.T) {
 		{"canceled before its end", State{Status: StatusCanceled, CurrentPeriodEnd: at(time.Hour)}, at(time.Hour), true},
 		{"canceled after its end", State{Status: StatusCanceled, CurrentPeriodEnd: at(-time.Second)}, at(-time.Second), false},
 		{"without an end", State{Status: StatusActive, AutoRenew: true}, nil, false},
+		{"with no end yet", State{Status: StatusActive, CurrentPeriodEnd: &Forever}, &Forever, true},
+		{"with no end yet, renewing", State{Status: StatusActive, AutoRenew: true, CurrentPeriodEnd: &Forever}, &Forever, true},
 		{"on hold", State{Status: StatusOnHold, CurrentPeriodEnd: at(time.Hour)}, nil, false},
 		{"paused", State{Status: StatusPaused, CurrentPeriodEnd: at(time.Hour)}, nil, false},
 		{"expired", State{Status: StatusExpired, CurrentPeriodEnd: at(time.Hour)}, nil, false},
