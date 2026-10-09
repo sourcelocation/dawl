@@ -119,6 +119,9 @@ func newFake(t *testing.T) (*Gateway, *fakeStripe) {
 		case r.URL.Path == "/v1/subscriptions/sub_1" && r.Method == http.MethodPost:
 			f.form = r.PostForm
 			_ = json.NewEncoder(w).Encode(stripeSubscription(f.status, r.PostForm.Get("cancel_at_period_end") == "true", 1))
+		case r.URL.Path == "/v1/prices/price_yearly" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "price_yearly", "object": "price", "unit_amount": 12000, "currency": "usd",
+				"recurring": map[string]any{"interval": "year", "interval_count": 1}})
 		case r.URL.Path == "/v1/customers/cus_1" && r.Method == http.MethodPost:
 			f.form = r.PostForm
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "cus_1", "object": "customer"})
@@ -211,5 +214,20 @@ func TestGatewayErrors(t *testing.T) {
 	}
 	if got := gatewayError(&sgo.Error{HTTPStatusCode: 400}); errors.Is(got, subscription.ErrUnavailable) || errors.Is(got, subscription.ErrNotFound) {
 		t.Errorf("a rejected request is neither missing nor an outage: %v", got)
+	}
+}
+
+func TestPrices(t *testing.T) {
+	gw, _ := newFake(t)
+	prices, err := gw.Prices(context.Background(), "price_yearly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := subscription.Price{ProductID: "price_yearly", Amount: 12000, Currency: "USD", Interval: subscription.Year, Every: 1}
+	if len(prices) != 1 || prices[0] != want {
+		t.Fatalf("prices = %+v, want %+v", prices, want)
+	}
+	if _, err := gw.Prices(context.Background(), "price_gone"); !errors.Is(err, subscription.ErrNotFound) {
+		t.Errorf("a missing price is ErrNotFound: %v", err)
 	}
 }
