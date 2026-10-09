@@ -4,7 +4,7 @@ name: Release
 # (v1.2.3); its description becomes the release notes. "Release version" checks the pull request:
 # it comes from master, its title is a version not released yet, and CI passed on its commit.
 # Merging it tags the merge commit and publishes the GitHub release. A released tag never moves:
-# only this workflow may create v* tags, and nobody may move or delete them (the repository's rulesets).
+# the repository's rulesets let nobody move or delete a v* tag.
 on:
   pull_request:
     branches: [production]
