@@ -1,0 +1,3 @@
+- Commits are Conventional Commits (`feat:`, `fix:`, `feat!:` for a breaking change); only those release. Pull requests are squash-merged under their title.
+- Releases are release-please's pull request into `master`: merging it tags `vX.Y.Z` and publishes the GitHub release.
+- Versions are exact everywhere (images, tools, actions pinned by commit), never `latest`.
