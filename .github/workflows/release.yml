@@ -1,6 +1,5 @@
 name: Release
 
-# See sourcelocation/.github's AGENTS.md.
 on:
   push:
     branches: [master]
@@ -10,22 +9,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    uses: sourcelocation/.github/.github/workflows/release.yml@main
+  release-please:
+    name: Release pull request
+    runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
       pull-requests: write
       issues: write
-      packages: write
-    secrets: inherit
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Not GITHUB_TOKEN: GitHub starts no CI for pull requests it opens.
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
 
   # So `go get` finds the version at once rather than whenever the proxy next looks.
   go-proxy:
     name: Announce it to the Go module proxy
-    if: needs.release.outputs.release_created == 'true'
-    needs: release
+    if: needs.release-please.outputs.created == 'true'
+    needs: release-please
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - env:
-          TAG: ${{ needs.release.outputs.tag }}
+          TAG: ${{ needs.release-please.outputs.tag }}
         run: curl -fsS --retry 5 --retry-all-errors "https://proxy.golang.org/github.com/sourcelocation/dawl/@v/$TAG.info"
